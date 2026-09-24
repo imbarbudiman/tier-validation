@@ -2,9 +2,11 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
 import logging
+from collections import defaultdict
 
 from odoo import api, fields, models
 from odoo.exceptions import ValidationError
+from odoo.fields import Domain
 
 _logger = logging.getLogger(__name__)
 
@@ -96,25 +98,64 @@ class TierReview(models.Model):
         for record in self:
             record.can_review = record._can_review_value()
 
+    def _get_document_reviews(self):
+        """Return all the reviews of the documents ``self`` belongs to."""
+        res_ids_by_model = defaultdict(set)
+        for review in self:
+            if review.model and review.res_id:
+                res_ids_by_model[review.model].add(review.res_id)
+        reviews = self.browse()
+        for model, res_ids in res_ids_by_model.items():
+            reviews |= self.search(
+                Domain("model", "=", model) & Domain("res_id", "in", list(res_ids))
+            )
+        return reviews
+
     def _update_review_status(self):
-        """Promote reviews that are currently available to pending."""
+        """Promote reviews that are currently available to pending.
+
+        The next sequence is computed per document, from all of its reviews:
+        callers may pass a partial recordset (the systray passes only the
+        reviews of the current user, across documents), which must not
+        promote a later tier before the earlier ones are approved.
+        """
         # To defer recompute, use context key
         # `tier_validation_defer_compute_can_review`.
         # Be sure to explicitely call the method afterwards.
         if self.env.context.get("tier_validation_defer_compute_can_review"):
             return
-        reviews = self.filtered(lambda rev: rev.status in ["waiting", "pending"])
-        if not reviews:
+        open_reviews = self.filtered(lambda rev: rev.status in ["waiting", "pending"])
+        if not open_reviews:
             return
-        next_seq = min(reviews.mapped("sequence"))
-        for record in reviews:
-            if record.status != "waiting":
-                continue
-            if record.approve_sequence and record.sequence != next_seq:
-                continue
-            record.status = "pending"
-            if record.definition_id.notify_on_pending:
-                record._notify_pending_status(record)
+        reviews_by_document = defaultdict(self.browse)
+        for review in open_reviews._get_document_reviews():
+            if review.status in ["waiting", "pending"]:
+                reviews_by_document[(review.model, review.res_id)] |= review
+        reviews = self.browse()
+        for document_reviews in reviews_by_document.values():
+            next_seq = min(document_reviews.mapped("sequence"))
+            for record in document_reviews:
+                if record.status != "waiting":
+                    continue
+                if record.approve_sequence and record.sequence != next_seq:
+                    continue
+                record.status = "pending"
+                if record.definition_id.notify_on_pending:
+                    record._notify_pending_status(record)
+            reviews |= document_reviews
+
+        # ``can_review`` depends on the other reviews of the document, which
+        # are not in its dependencies: approving a tier does not refresh the
+        # value stored on the next one when it is already pending.
+        def is_stale(review):
+            # Skip reviews of models whose tier validation was uninstalled.
+            Model = self.env.get(review.model)
+            if Model is None or "review_ids" not in Model._fields:
+                return False
+            return review.can_review != review.sudo()._can_review_value()
+
+        stale_reviews = reviews.filtered(is_stale)
+        self.env.add_to_compute(self._fields["can_review"], stale_reviews)
         reviews.flush_recordset(["status", "can_review"])
 
     def _can_review_value(self):

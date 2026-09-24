@@ -1005,6 +1005,68 @@ class TierTierValidation(CommonTierValidation):
         self.assertIn("needs to be validated", msg)
         self.assertIn(self.test_model._description, msg)
 
+    def _request_two_tier_sequence(self):
+        """Request a validation of two ``approve_sequence`` tiers: user 1
+        first, then user 2. Return the record and the second review."""
+        TierDefinition = self.env["tier.definition"]
+        # ``test_field`` = 2.5 matches none of the definitions of ``common.py``.
+        test_record = self.test_model.create({"test_field": 2.5})
+        for reviewer, sequence in ((self.test_user_1, 20), (self.test_user_2, 10)):
+            TierDefinition.create(
+                {
+                    "model_id": self.tester_model.id,
+                    "review_type": "individual",
+                    "reviewer_id": reviewer.id,
+                    "definition_domain": "[('test_field', '=', 2.5)]",
+                    "approve_sequence": True,
+                    "sequence": sequence,
+                }
+            )
+        reviews = test_record.request_validation()
+        review_second = reviews.filtered(lambda r: self.test_user_2 in r.reviewer_ids)
+        self.assertEqual(review_second.status, "waiting")
+        return test_record, review_second
+
+    def _systray_pending_count(self, user):
+        docs = user.with_user(user).review_user_count()
+        return sum(doc["pending_count"] for doc in docs)
+
+    def test_19e_systray_does_not_promote_later_tier(self):
+        """The systray of a later-tier reviewer only passes that reviewer's
+        own reviews to ``_update_review_status``. It must not promote their
+        review to ``pending`` before the earlier tier is approved, otherwise
+        ``can_review`` is stored as False and the review never shows up in
+        their systray once it is their turn.
+        """
+        test_record, review_second = self._request_two_tier_sequence()
+        # User 2 loads the web client while user 1 still has to approve.
+        self.assertEqual(self._systray_pending_count(self.test_user_2), 0)
+        self.assertEqual(review_second.status, "waiting")
+        self.assertFalse(review_second.can_review)
+
+        test_record.with_user(self.test_user_1).validate_tier()
+        self.assertEqual(review_second.status, "pending")
+        self.assertTrue(review_second.can_review)
+        self.assertEqual(self._systray_pending_count(self.test_user_2), 1)
+
+    def test_19f_stale_can_review_is_recomputed(self):
+        """A pending review whose stored ``can_review`` went stale, e.g. in a
+        database where the systray already promoted it too early, is fixed
+        by the next status update instead of staying hidden forever.
+        """
+        test_record, review_second = self._request_two_tier_sequence()
+        test_record.with_user(self.test_user_1).validate_tier()
+        self.assertEqual(review_second.status, "pending")
+        self.env.flush_all()
+        self.env.cr.execute(
+            "UPDATE tier_review SET can_review = FALSE WHERE id = %s",
+            [review_second.id],
+        )
+        self.env.invalidate_all()
+
+        self.assertEqual(self._systray_pending_count(self.test_user_2), 1)
+        self.assertTrue(review_second.can_review)
+
     def test_20_no_sequence(self):
         # Create new test record
         tier_review_obj = self.env["tier.review"]
